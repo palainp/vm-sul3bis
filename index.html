@@ -2,9 +2,115 @@
 <html>
     <head>
         <!-- head definitions go here -->
+		<style type="text/css">
+		samp {
+		  background: #000;
+		  border: 3px groove #ccc;
+		  color: #ccc;
+		  display: block;
+		  padding: 5px;
+		  width: 800px;
+		}
+		p {
+			width: 800px;
+		}
+		</style>
     </head>
     <body>
         <!-- the content goes here -->
-        Hello world from unipi !
+    <h1>Introduction</h1>
+	<p>This page is dedicated as a simple tutorial to run Unipi with Albatross and MirageOS !</p>
+
+
+    <h1>Setting up Albatross</h1>
+    <p>We first to install albatross and the solo5 suite, luckilly they exists as opam packages! (it may need some other packages installation,
+    such as happy_eyeballs and so on, I guess you will be able to figure that out).</p>
+    <samp>
+		opam install albatross solo5-elftool -y && \<br>
+		OPAM_SWITCH=`opam switch | grep '→' | cut -d' ' -f3` && \<br>
+		sudo cp ~/.opam/$OPAM_SWITCH/bin/solo5-hvt /var/lib/albatross && \<br>
+		<br>
+		git clone https://github.com/roburio/albatross ~/albatross && \<br>
+		cd albatross/packaging/Linux && \<br>
+		sudo cp albatross* /etc/systemd/system && \<br>
+		<br>
+		sudo systemctl daemon-reload && \<br>
+		sudo systemctl start albatross_daemon<br>
+    </samp>
+    <p> We will then prepare the virtual LAN inside our server</p>
+    <samp>
+		OUT_INTERFACE="ens32" && \<br>
+		BRIDGE_NAME="br0" && \<br>
+		BRIDGE_IP="10.0.0.1" && \<br>
+		BRIDGE_NETMASK_LENGTH="24" && \<br>
+		sudo ip link show ${BRIDGE_NAME} 2> /dev/null && sudo ip link del dev ${BRIDGE_NAME}<br>
+		<br>
+		sudo ip link add name ${BRIDGE_NAME} type bridge<br>
+		sudo ip addr add dev ${BRIDGE_NAME} ${BRIDGE_IP}/${BRIDGE_NETMASK_LENGTH}<br>
+		sudo ip link set dev ${BRIDGE_NAME} up<br>
+		sudo ip addr show ${BRIDGE_NAME}<br>
+		<br>
+		sudo sysctl -w net.ipv4.ip_forward=1<br>
+		sudo iptables -t nat -I POSTROUTING -o ${OUT_INTERFACE} -j MASQUERADE<br>
+		sudo iptables -I FORWARD -o ${OUT_INTERFACE} -i ${BRIDGE_NAME} -m state --state \<br>
+			RELATED,ESTABLISHED -j ACCEPT<br>
+		sudo iptables -I FORWARD -o ${BRIDGE_NAME} -i ${OUT_INTERFACE} -j ACCEPT<br>
+		<br>
+		UNIPI_IP="10.0.0.3"<br>
+		sudo iptables -t nat -I PREROUTING -i ${OUT_INTERFACE} -p tcp --dport 8080 -j DNAT \<br>
+			--to-destination ${UNIPI_IP}<br>
+    </samp>
+    <p> We will then start the albatross daemon. We first create the cacert.pem+cacert.key that will be used to sign
+    the VM we want to send to Albatross (it also creates the server.pem+server.key). Then we can launch the tls endpoint.</p>
+    <samp>
+		albatross-provision-ca generate cacert db && \<br>
+		albatross-tls-endpoint cacert.pem server.pem server.key<br>
+    </samp>
+	<p>Note: Optionally you can check the albatross logs with:</p>
+    <samp>
+		sudo journalctl -fu albatross'*'.service
+    </samp>
+
+
+    <h1>Building Unipi</h1>
+    <p> The following step will be done on the developper computer, thus we will have to transfer the cacert.pem+cacert.key on that computer.
+    Then we can build any unikernel, sign a creation and a destruction request then send them to albatross via their crafted X509 certificates.</p>
+    <samp>
+		git clone https://github.com/roburio/unipi.git && \<br>
+		cd unipi && mirage configure -t hvt && make depend && make && \<br>
+		<br>
+		VM_NAME=unipi && \<br>
+		DEV_PEM=cacert.pem && \<br>
+		DEV_KEY=cacert.key && \<br>
+		ALBATROSS_IP=... && \<br>
+		ALBATROSS_PORT=1025 && \<br>
+		<br>
+		albatross-provision-request create \<br>
+		--net=service:br0 --arg=--ipv4-gateway=10.0.0.1 --arg=--ipv4=10.0.0.3/24 --arg=--port=8080 \<br>
+		--arg=--remote="https://github.com/palainp/vm-sul3bis.git#pages" \<br>
+		--arg=--ssh-authenticator="SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU" \<br>
+		${VM_NAME} unipi.hvt && \<br>
+		mv ${VM_NAME}.req create_${VM_NAME}.req && \<br>
+		mv -f ${VM_NAME}.key create_${VM_NAME}.key && \<br>
+		<br>
+		albatross-provision-ca sign ${DEV_PEM} /dev/null ${DEV_KEY} create_${VM_NAME}.req && \<br>
+		mv ${VM_NAME}.pem create_${VM_NAME}.pem && \<br>
+		<br>
+		albatross-provision-request destroy ${VM_NAME} && \<br>
+		mv ${VM_NAME}.req destroy_${VM_NAME}.req && \<br>
+		mv -f ${VM_NAME}.key destroy_${VM_NAME}.key && \<br>
+		<br>
+		albatross-provision-ca sign ${DEV_PEM} /dev/null ${DEV_KEY} destroy_${VM_NAME}.req && \<br>
+		mv ${VM_NAME}.pem destroy_${VM_NAME}.pem && \<br>
+		<br>
+		albatross-client-remote-tls ${DEV_PEM} create_${VM_NAME}.pem create_${VM_NAME}.key ${ALBATROSS_IP}:${ALBATROSS_PORT}<br>
+	</samp>
+	<p>Note: The interface name (br0), the 10.0.0.1 IP address for the bridge on the server side, and 10.0.0.3 IP and the port for
+	the MASQUERADE redirection must be set accordingly with the configuration defined on the server side.</p>
+	<p>The --ssh-authenticator value can be get with the following:</p>
+	<samp>
+		ssh-keygen -lf <(ssh-keyscan -t ed25519 github.com 2>/dev/null)
+		256 SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU github.com (ED25519)
+	</samp>
     </body>
 </html>
